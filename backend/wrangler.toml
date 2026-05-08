@@ -1,0 +1,9 @@
+name = "monitor-legislativ-api"
+main = "src/index.ts"
+compatibility_date = "2024-05-08"
+
+[observability]
+enabled = true
+
+[vars]
+# DATABASE_URL = "postgres://username:password@neon-host/dbname"

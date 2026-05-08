@@ -1,0 +1,41 @@
+name: Legislative Scraper Cron
+
+on:
+  schedule:
+    # Runs at 02:00 AM UTC every day
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allows manual trigger from UI
+
+jobs:
+  scrape-and-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: 'scraper/package-lock.json'
+
+      - name: Install Scraper Dependencies
+        working-directory: ./scraper
+        run: npm ci || npm install
+
+      - name: Run Scraper
+        working-directory: ./scraper
+        run: npm start
+        
+      - name: Upload Scraped Data as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraped-legislative-data
+          path: scraper/data/*.json
+          retention-days: 7
+          
+      # Optional: You can add steps here to POST the JSON data to your backend API
+      # - name: Sync to Backend
+      #   run: |
+      #     curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer ${{ secrets.API_TOKEN }}" -d @scraper/data/scraped_data_*.json https://api.monitorlegislativ.ro/sync

@@ -1,14 +1,19 @@
-import axios from 'axios';
-import * as cheerio from 'cheerio';
-import * as iconv from 'iconv-lite';
+import { chromium, Page, Browser } from 'playwright';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 
 // Using relative import for the shared types
 import { LegislativeJSON, StatusHistoryEntry, Chamber } from '../../backend/src/types';
 
 const BASE_URL = 'https://www.cdep.ro';
-const LISTING_URL = `${BASE_URL}/pls/proiecte/upl_pck.lista`; // This is an example, it changes based on year/session
+const LISTING_URL = `${BASE_URL}/ords/pls/proiecte/upl_pck2015.lista?cam=2&anp=2026`;
+const CACHE_DIR = path.join(__dirname, '..', 'cache');
+
+// Ensure cache directory exists
+if (!fs.existsSync(CACHE_DIR)) {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+}
 
 // Romanian month abbreviations used by CDEP
 const roMonths: Record<string, string> = {
@@ -26,9 +31,8 @@ const roMonths: Record<string, string> = {
   'dec.': '12',
 };
 
-// Parses a date like "12 oct. 2024" to ISO string "2024-10-12T00:00:00.000Z"
 function parseRomanianDate(dateStr: string): string {
-  const parts = dateStr.trim().toLowerCase().split(' ');
+  const parts = dateStr.trim().toLowerCase().split(/\s+/);
   if (parts.length >= 3) {
     const day = parts[0].padStart(2, '0');
     const monthStr = parts[1];
@@ -38,116 +42,100 @@ function parseRomanianDate(dateStr: string): string {
     
     return `${year}-${month}-${day}T00:00:00.000Z`;
   }
-  return new Date().toISOString(); // Fallback
+  return new Date().toISOString();
 }
 
-async function fetchPage(url: string): Promise<string> {
-  try {
-    const response = await axios.get(url, {
-      responseType: 'arraybuffer',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; MonitorLegislativ/1.0)',
-      },
-    });
-    // Romanian govt websites usually use iso-8859-2
-    return iconv.decode(response.data, 'iso-8859-2');
-  } catch (error: any) {
-    console.error(`Error fetching page ${url}:`, error.message);
-    throw error;
-  }
+async function getRandomDelay(min = 1000, max = 3000) {
+  return new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * (max - min + 1) + min)));
 }
 
-async function scrapeListingPage(url: string): Promise<string[]> {
-  const html = await fetchPage(url);
-  const $ = cheerio.load(html);
-  
-  const projectLinks: string[] = [];
-  
-  // Find all links to detail pages
-  // E.g. <a href="/pls/proiecte/upl_pck.proiect?idp=12345">
-  $('a[href^="/pls/proiecte/upl_pck.proiect"]').each((i, el) => {
-    const href = $(el).attr('href');
-    if (href) {
-      projectLinks.push(`${BASE_URL}${href}`);
+/**
+ * Helper to get/set content from local cache
+ */
+async function navigateWithCache(page: Page, url: string, waitUntil: 'domcontentloaded' | 'networkidle' = 'domcontentloaded'): Promise<boolean> {
+    const urlHash = crypto.createHash('md5').update(url).digest('hex');
+    const cachePath = path.join(CACHE_DIR, `${urlHash}.html`);
+
+    if (fs.existsSync(cachePath)) {
+        console.log(`[Cache] Loading ${url} from ${cachePath}`);
+        const content = fs.readFileSync(cachePath, 'utf-8');
+        await page.setContent(content);
+        return true;
     }
-  });
-  
-  // Remove duplicates
-  return [...new Set(projectLinks)];
+
+    console.log(`[Network] Fetching ${url}...`);
+    await page.goto(url, { waitUntil });
+    const content = await page.content();
+    fs.writeFileSync(cachePath, content, 'utf-8');
+    return false;
 }
 
-async function scrapeDetailPage(url: string): Promise<LegislativeJSON | null> {
+async function scrapeListingPage(page: Page, url: string): Promise<string[]> {
+  // We navigate to base URL first to establish session if needed (not cached)
+  console.log(`Navigating to base: ${BASE_URL}`);
+  await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
+  await getRandomDelay(1000, 2000);
+
+  await navigateWithCache(page, url, 'domcontentloaded');
+  
+  const links = await page.locator('a[href*="/pls/proiecte/upl_pck2015.proiect"]').evaluateAll((elements: HTMLAnchorElement[]) => 
+    elements.map(el => el.href)
+  );
+  
+  return [...new Set(links)];
+}
+
+async function scrapeDetailPage(page: Page, url: string): Promise<LegislativeJSON | null> {
   try {
-    console.log(`Scraping detail page: ${url}`);
-    const html = await fetchPage(url);
-    const $ = cheerio.load(html);
-    
+    const isFromCache = await navigateWithCache(page, url, 'domcontentloaded');
+    if (!isFromCache) {
+        await getRandomDelay(1000, 2000);
+    }
+
     // Extract Title
-    // On CDEP, titles are usually in a table row or a specific font/bold element.
-    // Example target: <td class="headline">Proiect de lege privind...</td>
-    // Adjust selector based on actual layout.
-    let title = $('table tr td font b').first().text().trim() || $('title').text().trim();
-    if (!title) {
-        title = "Titlu Necunoscut";
-    }
+    const title = await page.locator('table tr td font b').first().innerText().catch(() => 'Titlu Necunoscut');
 
     // Extract Registration Number
-    // E.g. "PL-x nr. 123/2024" or "L123/2024"
-    // Assuming it's located near the title or in a specific row
-    const allText = $('body').text();
-    const regNumMatch = allText.match(/(?:PL-x nr\.|L)\s*(\d+\/\d{4})/i);
+    const bodyText = await page.locator('body').innerText();
+    const regNumMatch = bodyText.match(/(?:PL-x nr\.|L|PL-x)\s*(\d+\/\d{2}\.\d{2}\.\d{4}|\d+\/\d{4})/i);
     const registrationNumber = regNumMatch ? regNumMatch[0].trim() : 'N/A';
 
-    // Parse "Traseu legislativ" (Chronological list of events)
+    // Parse "Traseu legislativ"
     const statusHistory: StatusHistoryEntry[] = [];
     
-    // Often it's a table with multiple rows where the first column is date and second is the event
-    // E.g. <tr><td>12 oct. 2024</td><td>Inregistrat la Senat</td></tr>
-    $('table').each((i: number, table: any) => {
-        const tableText = $(table).text().toLowerCase();
-        if (tableText.includes('traseu legislativ') || tableText.includes('derularea procedurii')) {
-             $(table).find('tr').each((j: number, tr: any) => {
-                 const tds = $(tr).find('td');
-                 if (tds.length >= 2) {
-                     const dateText = $(tds[0]).text().trim();
-                     const eventText = $(tds[1]).text().trim();
-                     
-                     if (dateText.match(/^\d{1,2}\s+[a-z]+\.\s+\d{4}$/i)) {
-                         statusHistory.push({
-                             statusLabel: eventText,
-                             timestamp: parseRomanianDate(dateText),
-                             location: 'Camera Deputaților',
-                         });
-                     }
-                 }
-             });
-        }
-    });
+    // Find table containing legislative path
+    const rows = page.locator('table tr');
+    const rowCount = await rows.count();
     
-    // Extract Voting PDF links or tables
-    // Voting PDFs are usually linked with text "Vot" or "Stenograma"
-    const votingLinks: string[] = [];
-    $('a').each((i: number, el: any) => {
-        const href = $(el).attr('href');
-        const text = $(el).text().toLowerCase();
-        if (href && (text.includes('vot') || href.toLowerCase().includes('.pdf'))) {
-            votingLinks.push(href.startsWith('http') ? href : `${BASE_URL}${href}`);
+    for (let i = 0; i < rowCount; i++) {
+        const row = rows.nth(i);
+        const text = await row.innerText();
+        if (text.toLowerCase().includes('traseu legislativ') || text.toLowerCase().includes('derularea procedurii')) {
+            const siblingRows = page.locator('table').filter({ hasText: /Traseu legislativ|Derularea procedurii/i }).locator('tr');
+            const siblingCount = await siblingRows.count();
+            for (let j = 0; j < siblingCount; j++) {
+                const cols = siblingRows.nth(j).locator('td');
+                if (await cols.count() >= 2) {
+                    const dateText = (await cols.nth(0).innerText()).trim();
+                    const eventText = (await cols.nth(1).innerText()).trim();
+                    if (dateText.match(/^\d{1,2}\s+[a-z]+\.\s+\d{4}$/i)) {
+                        statusHistory.push({
+                            statusLabel: eventText,
+                            timestamp: parseRomanianDate(dateText),
+                            location: 'Camera Deputaților',
+                        });
+                    }
+                }
+            }
+            break;
         }
-    });
-    
-    if (votingLinks.length > 0) {
-        statusHistory.push({
-            statusLabel: `Vot înregistrat (vezi documente)`,
-            timestamp: new Date().toISOString(), // Use current or parsed date
-            location: 'Camera Deputaților',
-        });
     }
 
     const currentStatus = statusHistory.length > 0 ? statusHistory[statusHistory.length - 1].statusLabel : 'Înregistrat';
 
-    const result: LegislativeJSON = {
+    return {
         law: {
-            title,
+            title: title.trim(),
             registrationNumber,
             currentStatus,
             chamber: 'CDEP' as Chamber,
@@ -155,58 +143,44 @@ async function scrapeDetailPage(url: string): Promise<LegislativeJSON | null> {
         },
         statusHistory,
     };
-
-    return result;
   } catch (error) {
-    console.error(`Failed to parse detail page ${url}:`, error);
+    console.error(`Failed to parse ${url}:`, error);
     return null;
   }
 }
 
 async function main() {
-    console.log('Starting scraper...');
+    console.log('Starting Playwright scraper (2026 Session with Cache)...');
+    const browser: Browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        ignoreHTTPSErrors: true,
+    });
+    const page = await context.newPage();
+    
     const results: LegislativeJSON[] = [];
     
     try {
-        console.log(`Fetching listing from ${LISTING_URL}`);
-        // To not overwhelm the server, just do a dummy link or fetch the actual list
-        const projectUrls = await scrapeListingPage(LISTING_URL);
+        const projectUrls = await scrapeListingPage(page, LISTING_URL);
+        console.log(`Found ${projectUrls.length} projects. Processing first 3...`);
         
-        console.log(`Found ${projectUrls.length} projects. Processing first 5 for demonstration...`);
-        
-        const urlsToProcess = projectUrls.slice(0, 5);
-        if (urlsToProcess.length === 0) {
-             console.log("No URLs found, or we're simulating.");
-             // Simulating a run if the network request is blocked or structure changed
-             urlsToProcess.push(`${BASE_URL}/pls/proiecte/upl_pck.proiect?idp=12345`);
-        }
-
-        for (const url of urlsToProcess) {
-            const data = await scrapeDetailPage(url);
-            if (data) {
-                results.push(data);
-            }
-            // Polite scraping: wait a bit between requests
-            await new Promise(resolve => setTimeout(resolve, 1000));
+        for (const url of projectUrls.slice(0, 3)) {
+            const data = await scrapeDetailPage(page, url);
+            if (data) results.push(data);
         }
         
-        // Output to JSON file
         const outDir = path.join(__dirname, '..', 'data');
-        if (!fs.existsSync(outDir)) {
-             fs.mkdirSync(outDir);
-        }
+        if (!fs.existsSync(outDir)) fs.mkdirSync(outDir);
         
-        const outFile = path.join(outDir, `scraped_data_${new Date().toISOString().split('T')[0]}.json`);
+        const outFile = path.join(outDir, `scraped_data_2026_${new Date().toISOString().split('T')[0]}.json`);
         fs.writeFileSync(outFile, JSON.stringify(results, null, 2), 'utf-8');
         
-        console.log(`Successfully scraped ${results.length} projects.`);
-        console.log(`Data written to ${outFile}`);
-        
+        console.log(`Successfully processed ${results.length} projects to ${outFile}`);
     } catch (error) {
         console.error('Scraper failed:', error);
-        process.exit(1);
+    } finally {
+        await browser.close();
     }
 }
 
-// Run the script
 main();

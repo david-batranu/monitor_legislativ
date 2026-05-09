@@ -1,6 +1,7 @@
 name = "monitor-legislativ-api"
 main = "src/index.ts"
 compatibility_date = "2024-05-08"
+compatibility_flags = [ "nodejs_compat" ]
 
 [observability]
 enabled = true

@@ -51,7 +51,8 @@ export const fetchLaws = async (): Promise<LegislativeJSON[]> => {
   try {
     const res = await fetch(`${API_BASE}/laws`);
     if (!res.ok) throw new Error('Network error');
-    return res.json();
+    const json = await res.json();
+    return json.data;
   } catch (e) {
     console.warn('Using mock data for laws', e);
     return mockLaws;
@@ -62,7 +63,8 @@ export const fetchMemberVotes = async (memberId: string): Promise<VoteJSON[]> =>
   try {
     const res = await fetch(`${API_BASE}/members/${memberId}/votes`);
     if (!res.ok) throw new Error('Network error');
-    return res.json();
+    const json = await res.json();
+    return json.data;
   } catch (e) {
     console.warn('Using mock data for votes', e);
     return mockVotes;

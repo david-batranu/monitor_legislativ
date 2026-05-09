@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { cors } from 'hono/cors';
 import { eq, desc, and } from 'drizzle-orm';
 import { getDb } from './db';
 import { laws, statusHistory, members, votes } from './db/schema';
@@ -10,10 +11,13 @@ export type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>();
 
-app.get('/', (c) => c.text('Monitor Legislativ API'));
+app.use('/api/*', cors());
 
-// GET /laws - List laws with filters (status, chamber)
-app.get('/laws', async (c) => {
+// Health check
+app.get('/api', (c) => c.text('Monitor Legislativ API'));
+
+// GET /api/laws - List laws with filters (status, chamber)
+app.get('/api/laws', async (c) => {
   const db = getDb(c.env.DATABASE_URL);
   const { status, chamber } = c.req.query();
   
@@ -24,19 +28,38 @@ app.get('/laws', async (c) => {
       if (chamber) filters.push(eq(laws.chamber, chamber));
       return filters.length > 0 ? and(...filters) : undefined;
     },
+    with: {
+      statusHistory: true,
+    },
     orderBy: [desc(laws.id)],
   });
 
-  return c.json({ data: results });
+  // Map to LegislativeJSON format
+  const data = results.map(l => ({
+    law: {
+      title: l.title,
+      registrationNumber: l.registrationNumber,
+      currentStatus: l.currentStatus,
+      chamber: l.chamber as any,
+      originalUrl: l.originalUrl,
+    },
+    statusHistory: l.statusHistory.map(h => ({
+      statusLabel: h.statusLabel,
+      location: h.location,
+      timestamp: h.timestamp.toISOString(),
+    })),
+  }));
+
+  return c.json({ data });
 });
 
-// GET /laws/:id - Detailed view including status timeline and vote breakdown
-app.get('/laws/:id', async (c) => {
+// GET /api/laws/:id - Detailed view including status timeline and vote breakdown
+app.get('/api/laws/:id', async (c) => {
   const db = getDb(c.env.DATABASE_URL);
   const { id } = c.req.param();
 
   // Basic UUID validation
-  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (!uuidRegex.test(id)) {
     return c.json({ error: 'Invalid ID format' }, 400);
   }
@@ -76,8 +99,37 @@ app.get('/laws/:id', async (c) => {
   return c.json({ data: { ...law, voteBreakdown } });
 });
 
-// POST /sync/law - Upsert a law and its status history
-app.post('/sync/law', async (c) => {
+// GET /api/members/:id/votes - Voting history for a specific member
+app.get('/api/members/:id/votes', async (c) => {
+  const db = getDb(c.env.DATABASE_URL);
+  const { id } = c.req.param();
+
+  const results = await db.query.votes.findMany({
+    where: (votes, { eq }) => eq(votes.memberId, id),
+    with: {
+      law: true,
+      member: true,
+    },
+    orderBy: [desc(votes.voteDate)],
+  });
+
+  const data = results.map(v => ({
+    lawRegistrationNumber: v.law.registrationNumber,
+    member: {
+      name: v.member.name,
+      party: v.member.party,
+      chamber: v.member.chamber as any,
+      photoUrl: v.member.photoUrl,
+    },
+    voteValue: v.voteValue as any,
+    voteDate: v.voteDate.toISOString(),
+  }));
+
+  return c.json({ data });
+});
+
+// POST /api/sync/law - Upsert a law and its status history
+app.post('/api/sync/law', async (c) => {
   const db = getDb(c.env.DATABASE_URL);
   const payload = await c.req.json<LegislativeJSON>();
 
@@ -124,8 +176,8 @@ app.post('/sync/law', async (c) => {
   return c.json({ message: 'Law synced', lawId: upsertedLaw.id });
 });
 
-// POST /sync/vote - Record individual member votes
-app.post('/sync/vote', async (c) => {
+// POST /api/sync/vote - Record individual member votes
+app.post('/api/sync/vote', async (c) => {
   const db = getDb(c.env.DATABASE_URL);
   const payload = await c.req.json<VoteJSON>();
 

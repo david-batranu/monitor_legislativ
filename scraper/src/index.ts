@@ -57,7 +57,7 @@ async function navigateWithCache(page: Page, url: string, waitUntil: 'domcontent
     const cachePath = path.join(CACHE_DIR, `${urlHash}.html`);
 
     if (fs.existsSync(cachePath)) {
-        console.log(`[Cache] Loading ${url} from ${cachePath}`);
+        console.log(`[Cache] Loading ${url} from disk`);
         const content = fs.readFileSync(cachePath, 'utf-8');
         await page.setContent(content);
         return true;
@@ -71,15 +71,31 @@ async function navigateWithCache(page: Page, url: string, waitUntil: 'domcontent
 }
 
 async function scrapeListingPage(page: Page, url: string): Promise<string[]> {
-  // We navigate to base URL first to establish session if needed (not cached)
-  console.log(`Navigating to base: ${BASE_URL}`);
-  await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
-  await getRandomDelay(1000, 2000);
+  const urlHash = crypto.createHash('md5').update(url).digest('hex');
+  const cachePath = path.join(CACHE_DIR, `${urlHash}.html`);
 
-  await navigateWithCache(page, url, 'domcontentloaded');
+  if (fs.existsSync(cachePath)) {
+    console.log(`[Cache] Loading listing ${url} from disk`);
+    const content = fs.readFileSync(cachePath, 'utf-8');
+    await page.setContent(content);
+  } else {
+    console.log(`Navigating to base: ${BASE_URL}`);
+    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
+    await getRandomDelay(1000, 2000);
+
+    console.log(`[Network] Fetching listing ${url}...`);
+    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    const content = await page.content();
+    fs.writeFileSync(cachePath, content, 'utf-8');
+  }
   
-  const links = await page.locator('a[href*="/pls/proiecte/upl_pck2015.proiect"]').evaluateAll((elements: HTMLAnchorElement[]) => 
-    elements.map(el => el.href)
+  const links = await page.locator('a[href*="/pls/proiecte/upl_pck2015.proiect"]').evaluateAll((elements: HTMLAnchorElement[], base) => 
+    elements.map(el => {
+        const href = el.getAttribute('href') || '';
+        if (href.startsWith('http')) return href;
+        const separator = href.startsWith('/') ? '' : '/';
+        return `${base}${separator}${href}`;
+    }), BASE_URL
   );
   
   return [...new Set(links)];
@@ -89,45 +105,55 @@ async function scrapeDetailPage(page: Page, url: string): Promise<LegislativeJSO
   try {
     const isFromCache = await navigateWithCache(page, url, 'domcontentloaded');
     if (!isFromCache) {
-        await getRandomDelay(1000, 2000);
+        await getRandomDelay(2000, 4000);
     }
 
-    // Extract Title
-    const title = await page.locator('table tr td font b').first().innerText().catch(() => 'Titlu Necunoscut');
+    // Extract Title - more robust selector for CDEP ORDS layout
+    const title = await page.locator('.detalii-initiativa h4').first().innerText()
+        .catch(() => page.locator('h1, h2').first().innerText())
+        .catch(() => 'Titlu Necunoscut');
 
     // Extract Registration Number
-    const bodyText = await page.locator('body').innerText();
-    const regNumMatch = bodyText.match(/(?:PL-x nr\.|L|PL-x)\s*(\d+\/\d{2}\.\d{2}\.\d{4}|\d+\/\d{4})/i);
-    const registrationNumber = regNumMatch ? regNumMatch[0].trim() : 'N/A';
+    const registrationNumber = await page.locator('.boxTitle h1').first().innerText()
+        .catch(async () => {
+            const bodyText = await page.innerText('body');
+            const match = bodyText.match(/(?:PL-x|L|PL-x nr\.)\s*(\d+(?:\/\d{2}\.\d{2}\.\d{4}|\/\d{4}))/i);
+            return match ? match[0].trim() : 'N/A';
+        });
 
-    // Parse "Traseu legislativ"
+    // Parse "Traseu legislativ" (Derularea procedurii legislative)
     const statusHistory: StatusHistoryEntry[] = [];
     
-    // Find table containing legislative path
-    const rows = page.locator('table tr');
-    const rowCount = await rows.count();
+    // Target the table that follows the "Derularea procedurii legislative" header
+    // or look for a table with a row of bgcolor="#e7c24f"
+    const tables = page.locator('table');
+    const tableCount = await tables.count();
     
-    for (let i = 0; i < rowCount; i++) {
-        const row = rows.nth(i);
-        const text = await row.innerText();
-        if (text.toLowerCase().includes('traseu legislativ') || text.toLowerCase().includes('derularea procedurii')) {
-            const siblingRows = page.locator('table').filter({ hasText: /Traseu legislativ|Derularea procedurii/i }).locator('tr');
-            const siblingCount = await siblingRows.count();
-            for (let j = 0; j < siblingCount; j++) {
-                const cols = siblingRows.nth(j).locator('td');
-                if (await cols.count() >= 2) {
+    for (let i = 0; i < tableCount; i++) {
+        const table = tables.nth(i);
+        const hasHeader = await table.locator('tr[bgcolor="#e7c24f"]').count() > 0;
+        if (hasHeader) {
+            const rows = table.locator('tr[valign="top"]');
+            const rowCount = await rows.count();
+            for (let j = 0; j < rowCount; j++) {
+                const row = rows.nth(j);
+                const cols = row.locator('td');
+                if (await cols.count() >= 3) {
                     const dateText = (await cols.nth(0).innerText()).trim();
-                    const eventText = (await cols.nth(1).innerText()).trim();
-                    if (dateText.match(/^\d{1,2}\s+[a-z]+\.\s+\d{4}$/i)) {
+                    const eventText = (await cols.nth(2).innerText()).trim();
+                    // Match date format: 02.02.2026 or 12 oct. 2026
+                    if (dateText.match(/^\d{2}\.\d{2}\.\d{4}$/) || dateText.match(/^\d{1,2}\s+[a-z]+\.\s+\d{4}$/i)) {
                         statusHistory.push({
-                            statusLabel: eventText,
-                            timestamp: parseRomanianDate(dateText),
+                            statusLabel: eventText.split('\n')[0].trim(), // Take only first line of event
+                            timestamp: dateText.includes('.') && !dateText.includes(' ') 
+                                ? new Date(dateText.split('.').reverse().join('-')).toISOString()
+                                : parseRomanianDate(dateText),
                             location: 'Camera Deputaților',
                         });
                     }
                 }
             }
-            break;
+            if (statusHistory.length > 0) break;
         }
     }
 
@@ -136,7 +162,7 @@ async function scrapeDetailPage(page: Page, url: string): Promise<LegislativeJSO
     return {
         law: {
             title: title.trim(),
-            registrationNumber,
+            registrationNumber: registrationNumber.trim(),
             currentStatus,
             chamber: 'CDEP' as Chamber,
             originalUrl: url,
@@ -150,7 +176,7 @@ async function scrapeDetailPage(page: Page, url: string): Promise<LegislativeJSO
 }
 
 async function main() {
-    console.log('Starting Playwright scraper (2026 Session with Cache)...');
+    console.log('Starting Playwright scraper (2026 Session)...');
     const browser: Browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -166,7 +192,11 @@ async function main() {
         
         for (const url of projectUrls.slice(0, 3)) {
             const data = await scrapeDetailPage(page, url);
-            if (data) results.push(data);
+            if (data) {
+                results.push(data);
+                console.log(`Successfully scraped: ${data.law.registrationNumber} - ${data.law.title.substring(0, 50)}...`);
+                console.log(`  Events: ${data.statusHistory?.length || 0}`);
+            }
         }
         
         const outDir = path.join(__dirname, '..', 'data');
